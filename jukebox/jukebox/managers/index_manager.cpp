@@ -524,4 +524,98 @@ void IndexManager::onDownloadFinish(
 
         insertedSong = r.unwrap();
     } else if (metadata->ytId.has_value()) {
-        Result<YTSong*> r = destination->add(YT
+        Result<YTSong*> r = destination->add(YTSong(
+            SongMetadata(
+                destination->songID(), metadata->uniqueID, metadata->name, metadata->artist, std::nullopt,
+                metadata->startOffset
+            ),
+            metadata->ytId.value(), metadata->parentID->m_id, path
+        ));
+        if (r.isErr()) {
+            orElse(r.unwrapErr());
+            return;
+        }
+
+        insertedSong = r.unwrap();
+    } else {
+        const std::string err = "No url or YouTube ID on song";
+        orElse(err);
+        return;
+    }
+
+    if (auto commitRes = destination->commit(); commitRes.isErr()) {
+        const std::string err = fmt::format("Couldn't commit downloaded song metadata. {}", commitRes.unwrapErr());
+        log::error("{}", err);
+        event::SongDownloadFailed(destination->songID())
+            .send(event::SongDownloadFailedData {destination->songID(), uniqueId, err});
+        return;
+    }
+
+    event::SongDownloadFinished().send(event::SongDownloadFinishedData {std::optional(metadata), insertedSong});
+}
+
+void IndexManager::registerIndexNongs(Nongs* destination) {
+    if (!m_nongsForId.contains(destination->songID())) { return; }
+
+    destination->indexSongs().clear();
+    for (IndexSongMetadata* s : m_nongsForId[destination->songID()]) { destination->indexSongs().push_back(s); }
+}
+
+std::filesystem::path IndexManager::pathToCachedIndex(const std::string_view url) {
+    static constexpr std::hash<std::string_view> hasher;
+    std::size_t hashValue = hasher(url);
+
+    return this->baseIndexesPath() / fmt::format("{0:x}.json", hashValue);
+}
+
+std::optional<std::string> IndexManager::lastModifiedForIndex(const std::string_view url) {
+    auto json = Mod::get()->getSavedValue<matjson::Value>("cached-index-last-modified");
+    if (!json.contains(url)) { return std::nullopt; }
+    return json[url].asString().mapOr<std::optional<std::string>>(std::nullopt, [](auto i) {
+        return std::optional(std::move(i));
+    });
+}
+
+void IndexManager::setLastModifiedForIndex(const std::string_view url, std::optional<std::string> value) {
+    auto json = Mod::get()->getSavedValue<matjson::Value>("cached-index-last-modified");
+    if (value.has_value()) {
+        log::debug("Setting Last-Modified for index {}: {}", url, *value);
+        json.set(url, *value);
+    } else {
+        log::debug("Removing Last-Modified for index {}", url);
+        json.erase(url);
+    }
+    Mod::get()->setSavedValue("cached-index-last-modified", json);
+}
+
+std::optional<std::string> IndexManager::etagForIndex(const std::string_view url) {
+    auto json = Mod::get()->getSavedValue<matjson::Value>("cached-index-etag");
+    if (!json.contains(url)) { return std::nullopt; }
+    return json[url].asString().mapOr<std::optional<std::string>>(std::nullopt, [](auto i) {
+        return std::optional(std::move(i));
+    });
+}
+
+void IndexManager::setEtagForIndex(const std::string_view url, std::optional<std::string> value) {
+    auto json = Mod::get()->getSavedValue<matjson::Value>("cached-index-etag");
+    if (value.has_value()) {
+        log::debug("Setting etag for index {}: {}", url, *value);
+        json.set(url, *value);
+    } else {
+        log::debug("Removing etag for index {}", url);
+        json.erase(url);
+    }
+    Mod::get()->setSavedValue("cached-index-etag", json);
+}
+
+void IndexManager::clearCaches() {
+    for (const auto& entry : std::filesystem::directory_iterator(this->baseIndexesPath())) {
+        auto res = asp::fs::remove(asp::fs::Path::fromStdPath(entry.path()));
+        if (res.isErr()) { log::warn("Failed to remove cached index: {}", res.unwrapErr()); }
+    }
+
+    Mod::get()->setSavedValue("cached-index-etag", matjson::makeObject({}));
+    Mod::get()->setSavedValue("cached-index-last-modified", matjson::makeObject({}));
+}
+
+};  // namespace jukebox
